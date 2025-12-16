@@ -247,6 +247,21 @@ body {
   white-space: nowrap;
 }
 
+.book-cover{
+  width: 100%;
+  aspect-ratio: 2 / 3;
+  object-fit: cover;
+  border-radius: 14px;
+  display: block;
+}
+.cookbook-cover {
+  width: 100%;
+  aspect-ratio: 2 / 3;
+  object-fit: cover;
+  border-radius: 12px;
+  display: block;
+}
+
 .card-body {
   padding: 0;
   display: grid;

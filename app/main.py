@@ -7,6 +7,7 @@ Next milestone: SQLite-backed indexing for fast library plus recipe metadata.
 
 import os
 import sqlite3
+import hashlib
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -14,6 +15,11 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.responses import FileResponse
+
+try:
+    from PIL import Image, ImageDraw, ImageFont  # type: ignore
+except Exception:  # Pillow is optional in dev
+    Image = ImageDraw = ImageFont = None  # type: ignore
 
 import logging
 
@@ -23,7 +29,101 @@ from app.config import get_settings
 from app.library import ALLOWED_SUFFIXES, list_cookbooks
 
 
+
 APP_NAME = "Bayleaf"
+
+
+# --- Cover thumbnail helpers (Phase 1: placeholders, cached on disk) ---
+
+def _covers_dir() -> Path:
+    """Directory where generated cover thumbnails are cached."""
+    # Allow override, default to a persistent path mounted via the /data volume.
+    p = Path(_get_env("BAYLEAF_COVERS_DIR", "/data/covers"))
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _cover_cache_key(rel_path: str, mtime: int) -> str:
+    """Stable cache key for a book. Includes mtime so edits regenerate the cover."""
+    return hashlib.sha1(f"{rel_path}|{mtime}".encode("utf-8")).hexdigest()
+
+
+def _title_from_filename(file_name: str) -> str:
+    """Best-effort title extraction from file name.
+
+    Many files are in the format: 'Author - Title.ext'.
+    """
+    stem = Path(file_name).stem
+    parts = [p.strip() for p in stem.split(" - ", 1)]
+    if len(parts) == 2 and parts[1]:
+        return parts[1]
+    return stem
+
+
+def _make_placeholder_cover(out_path: Path, title: str) -> None:
+    # If Pillow isn't available, fall back to a tiny SVG placeholder.
+    if Image is None or ImageDraw is None:
+        svg = f"""<svg xmlns='http://www.w3.org/2000/svg' width='600' height='900'>
+<rect width='100%' height='100%' fill='#F4F1EC'/>
+<rect x='50' y='60' width='500' height='780' fill='none' stroke='#5F7A6A' stroke-width='6'/>
+<text x='80' y='110' font-family='sans-serif' font-size='24' fill='#5F7A6A'>Bayleaf</text>
+<text x='80' y='180' font-family='sans-serif' font-size='22' fill='#1F2A24'>{(title or 'Untitled').replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')}</text>
+</svg>"""
+        out_path.write_text(svg, encoding="utf-8")
+        return
+
+    w, h = 600, 900
+    img = Image.new("RGB", (w, h), "#F4F1EC")
+    draw = ImageDraw.Draw(img)
+
+    # Use a default font to keep the Docker image simple.
+    try:
+        font = ImageFont.load_default() if ImageFont is not None else None
+    except Exception:
+        font = None
+
+    # Border
+    draw.rectangle([50, 60, w - 50, h - 60], outline="#5F7A6A", width=6)
+
+    # Header
+    draw.text((80, 90), "Bayleaf", fill="#5F7A6A", font=font)
+
+    # Wrap title lines crudely by character count.
+    text = (title or "Untitled").strip()
+    words = text.split()
+    lines: list[str] = []
+    line = ""
+    for word in words:
+        test = (line + " " + word).strip()
+        if len(test) > 26 and line:
+            lines.append(line)
+            line = word
+        else:
+            line = test
+    if line:
+        lines.append(line)
+    lines = lines[:10]
+
+    y = 170
+    for ln in lines:
+        draw.text((80, y), ln, fill="#1F2A24", font=font)
+        y += 45
+
+    img.save(out_path, "PNG", optimize=True)
+
+
+def _attach_cover_urls(app: FastAPI, books: list[dict]) -> None:
+    """Attach a cover URL to each book dict for templates."""
+    for b in books:
+        rel_path = (b.get("rel_path") or "").strip()
+        if not rel_path:
+            b["cover_url"] = ""
+            continue
+        try:
+            # url_path_for gives a relative URL, which is ideal for reverse proxies.
+            b["cover_url"] = str(app.url_path_for("cover", rel_path=rel_path))
+        except Exception:
+            b["cover_url"] = f"/cover/{rel_path}"
 
 
 # Helper to normalise cookbook entries (dicts or objects) to dicts for templates/indexer
@@ -550,6 +650,7 @@ def create_app() -> FastAPI:
 
         conn: sqlite3.Connection = app.state.db
         books, total = _query_books(conn, q)
+        _attach_cover_urls(app, books)
 
         if total == 0:
             # Fallback to filesystem scan so the UI never shows empty when files are mounted.
@@ -571,6 +672,7 @@ def create_app() -> FastAPI:
                         bd["rel_path"] = bd.get("name") or "unknown"
                 books = fs_books
                 total = len(fs_books)
+                _attach_cover_urls(app, books)
                 if getattr(app.state, "last_index_error", ""):
                     notice = (
                         (notice + " " if notice else "")
@@ -586,6 +688,9 @@ def create_app() -> FastAPI:
                     (notice + " " if notice else "")
                     + f"Could not scan filesystem: {exc}"
                 )
+
+        if books:
+            _attach_cover_urls(app, books)
 
         return templates.TemplateResponse(
             "library.html",
@@ -626,6 +731,67 @@ def create_app() -> FastAPI:
             media_type = "application/epub+zip"
 
         return FileResponse(path=str(file_path), media_type=media_type, filename=file_path.name)
+
+
+    @app.head("/cover/{rel_path:path}")
+    def cover_head(rel_path: str):
+        # FastAPI doesn't always auto-register HEAD for this route in our setup.
+        # Delegate to the GET handler. Starlette will strip the body for HEAD.
+        return cover(rel_path)
+
+    @app.get("/cover/{rel_path:path}", name="cover")
+    def cover(rel_path: str):
+        """Return a cover thumbnail for a book.
+
+        Priority:
+        1) Real EPUB cover (cached under /data/covers)
+        2) Placeholder cover (cached)
+        """
+        settings = get_settings()
+        file_path = _safe_resolve(settings.library_dir, rel_path)
+
+        mtime = int(file_path.stat().st_mtime)
+        key = _cover_cache_key(rel_path, mtime)
+        covers_dir = _covers_dir()
+
+        suffix = file_path.suffix.lower()
+
+        # 1) Real cover for EPUBs via app/covers.py
+        if suffix == ".epub":
+            try:
+                from app.covers import get_or_create_epub_cover
+
+                out_path = get_or_create_epub_cover(
+                    epub_path=file_path,
+                    covers_dir=covers_dir,
+                    cache_key=key,
+                )
+
+                if out_path is not None:
+                    out_path = Path(out_path)
+                    if out_path.exists() and out_path.is_file():
+                        ext = out_path.suffix.lower()
+                        if ext in {".jpg", ".jpeg"}:
+                            return FileResponse(str(out_path), media_type="image/jpeg")
+                        if ext == ".webp":
+                            return FileResponse(str(out_path), media_type="image/webp")
+                        if ext == ".svg":
+                            return FileResponse(str(out_path), media_type="image/svg+xml")
+                        return FileResponse(str(out_path), media_type="image/png")
+            except Exception as exc:
+                logger.info("EPUB cover extraction failed for %s: %s", rel_path, exc)
+
+        # 2) Fallback: cached placeholder
+        out_path = covers_dir / f"{key}.png"
+        if not out_path.exists():
+            title = _title_from_filename(file_path.name)
+            _make_placeholder_cover(out_path, title)
+
+        # If we had to fall back to SVG, serve it correctly
+        if out_path.suffix.lower() == ".svg":
+            return FileResponse(str(out_path), media_type="image/svg+xml")
+
+        return FileResponse(str(out_path), media_type="image/png")
 
     return app
 

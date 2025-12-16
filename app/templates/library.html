@@ -1,4 +1,3 @@
-
 <!doctype html>
 <html lang="en">
   <head>
@@ -49,11 +48,14 @@
           {% for book in cookbooks %}
             <div class="card">
               <div class="cover">
-                {% if book.thumb_url %}
-                  <img src="{{ book.thumb_url }}" alt="Cover" loading="lazy" />
-                {% else %}
-                  <div class="placeholder">No cover yet</div>
-                {% endif %}
+                <img
+                  src="/cover/{{ book.rel_path | urlencode }}"
+                  alt="Cover for {{ book.display_name }}"
+                  loading="lazy"
+                  class="cover-img"
+                  onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';"
+                />
+                <div class="placeholder" style="display:none;">No cover yet</div>
               </div>
 
               <div class="title" title="{{ book.display_name }}">{{ book.display_name }}</div>
