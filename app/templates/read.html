@@ -1,10 +1,9 @@
-cat > app/templates/read.html <<'EOF'
 <!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>{{ title }}. Foraged</title>
+    <title>{{ title }} · Bayleaf</title>
     <link rel="stylesheet" href="{{ request.url_for('static', path='app.css') }}" />
   </head>
   <body>
@@ -32,4 +31,3 @@ cat > app/templates/read.html <<'EOF'
     </div>
   </body>
 </html>
-EOF

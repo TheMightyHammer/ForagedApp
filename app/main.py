@@ -25,12 +25,33 @@ import logging
 
 logger = logging.getLogger("bayleaf")
 
-from app.config import get_settings
+from app.config import get_env, get_settings
 from app.library import ALLOWED_SUFFIXES, list_cookbooks
 
 
 
+
 APP_NAME = "Bayleaf"
+
+# Minimum characters before we apply a text filter (helps live-search UX)
+DEFAULT_MIN_SEARCH_CHARS = 3
+
+def _min_search_chars() -> int:
+    try:
+        return max(0, int(get_env("BAYLEAF_MIN_SEARCH_CHARS", str(DEFAULT_MIN_SEARCH_CHARS))))
+    except Exception:
+        return DEFAULT_MIN_SEARCH_CHARS
+
+
+def _normalise_search_query(q: str | None) -> str:
+    """Return a normalised query string.
+
+    If the query is shorter than the configured minimum, treat it as empty.
+    """
+    qn = (q or "").strip()
+    if len(qn) < _min_search_chars():
+        return ""
+    return qn
 
 
 # --- Cover thumbnail helpers (Phase 1: placeholders, cached on disk) ---
@@ -38,7 +59,7 @@ APP_NAME = "Bayleaf"
 def _covers_dir() -> Path:
     """Directory where generated cover thumbnails are cached."""
     # Allow override, default to a persistent path mounted via the /data volume.
-    p = Path(_get_env("BAYLEAF_COVERS_DIR", "/data/covers"))
+    p = Path(get_env("BAYLEAF_COVERS_DIR", "/data/covers"))
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -141,6 +162,7 @@ def _cookbook_to_dict(b) -> dict:
         rel_path = b.get("rel_path")
         abs_path = b.get("abs_path") or b.get("path") or b.get("file_path")
         name = b.get("name")
+        file_name = b.get("file_name")
         suffix = b.get("suffix")
         size = b.get("size")
         mtime = b.get("mtime")
@@ -148,22 +170,35 @@ def _cookbook_to_dict(b) -> dict:
         rel_path = getattr(b, "rel_path", None)
         abs_path = getattr(b, "abs_path", None) or getattr(b, "path", None) or getattr(b, "file_path", None)
         name = getattr(b, "name", None)
+        file_name = getattr(b, "file_name", None)
         suffix = getattr(b, "suffix", None)
         size = getattr(b, "size", None)
         mtime = getattr(b, "mtime", None)
 
     rel_path_str = str(rel_path) if rel_path else ""
     abs_path_str = str(abs_path) if abs_path else ""
+    candidate_path = rel_path_str or abs_path_str
+    candidate_name = Path(candidate_path).name if candidate_path else ""
 
-    # Prefer name if provided. Otherwise fall back to file name from rel_path/abs_path.
+    file_name_str = str(file_name).strip() if file_name else ""
+    if not file_name_str:
+        file_name_str = candidate_name
+
+    # Prefer provided display name, otherwise derive from the file name.
     if name is not None and str(name).strip():
-        name_str = str(name)
+        name_str = str(name).strip()
     else:
-        name_str = Path(rel_path_str or abs_path_str).name
+        if file_name_str:
+            name_str = Path(file_name_str).stem or file_name_str
+        elif candidate_path:
+            name_str = Path(candidate_path).stem
+        else:
+            name_str = "Untitled"
 
-    # Prefer suffix if provided. Otherwise infer from rel_path/abs_path.
+    # Prefer suffix if provided. Otherwise infer from the best-known filename.
     if suffix is None or str(suffix).strip() == "":
-        suffix_str = Path(rel_path_str or abs_path_str).suffix
+        suffix_source = file_name_str or candidate_path or ""
+        suffix_str = Path(suffix_source).suffix if suffix_source else ""
     else:
         suffix_str = str(suffix)
 
@@ -171,35 +206,16 @@ def _cookbook_to_dict(b) -> dict:
         "rel_path": rel_path_str,
         "abs_path": abs_path_str,
         "name": name_str,
+        "file_name": file_name_str or name_str,
         "suffix": suffix_str,
         "size": int(size or 0),
         "mtime": int(mtime or 0),
     }
 
 
-def _get_env(name: str, default: str) -> str:
-    """Read env var with backwards-compatible fallback.
-
-    We standardise on uppercase BAYLEAF_* variables.
-    We also accept legacy mixed-case Bayleaf_* variables to avoid breaking existing setups.
-    """
-
-    primary = os.getenv(name)
-    if primary is not None:
-        value = primary.strip()
-        return value or default
-
-    legacy_name = name.replace("BAYLEAF_", "Bayleaf_")
-    legacy = os.getenv(legacy_name)
-    if legacy is not None:
-        value = legacy.strip()
-        return value or default
-
-    return default
-
 
 def _db_path() -> str:
-    return _get_env("BAYLEAF_DB_PATH", "/data/bayleaf.db")
+    return get_env("BAYLEAF_DB_PATH", "/data/bayleaf.db")
 
 
 def _connect_db() -> sqlite3.Connection:
@@ -411,9 +427,10 @@ def _index_books(conn: sqlite3.Connection, library_dir: Path | str) -> int:
         with conn:
             for b in book_dicts:
                 rel_path = str(b["rel_path"])
-                file_name = str(b.get("name") or Path(rel_path).name)
-                suffix = str(b.get("suffix") or Path(rel_path).suffix).lower()
-                file_type = suffix.lstrip(".")
+                file_name = str(b.get("file_name") or Path(rel_path).name)
+                suffix_value = b.get("suffix") or Path(file_name).suffix or Path(rel_path).suffix
+                suffix = str(suffix_value or "").lower()
+                file_type = suffix.lstrip(".") or Path(rel_path).suffix.lower().lstrip(".")
                 file_size = int(b.get("size") or 0)
                 modified_mtime = int(b.get("mtime") or 0)
 
@@ -437,7 +454,7 @@ def _index_books(conn: sqlite3.Connection, library_dir: Path | str) -> int:
 
 
 def _query_books(conn: sqlite3.Connection, q: str | None) -> tuple[list[dict], int]:
-    q = (q or "").strip()
+    q = _normalise_search_query(q)
 
     if q:
         like = f"%{q.lower()}%"
@@ -463,13 +480,15 @@ def _query_books(conn: sqlite3.Connection, q: str | None) -> tuple[list[dict], i
     books: list[dict] = []
     for r in rows:
         rel_path = str(r["rel_path"])
-        name = str(r["file_name"])
-        file_type = str(r["file_type"])
-        suffix = f".{file_type}" if file_type else Path(rel_path).suffix
+        file_name = str(r["file_name"])
+        file_type = str(r["file_type"] or "")
+        suffix = f".{file_type}" if file_type else Path(file_name).suffix or Path(rel_path).suffix
+        display_name = Path(file_name).stem or file_name
         books.append(
             {
                 "rel_path": rel_path,
-                "name": name,
+                "name": display_name,
+                "file_name": file_name,
                 "suffix": suffix,
                 "size": int(r["file_size"]),
                 "mtime": int(r["modified_mtime"]),
@@ -478,6 +497,89 @@ def _query_books(conn: sqlite3.Connection, q: str | None) -> tuple[list[dict], i
 
     total = conn.execute("SELECT COUNT(*) AS c FROM books").fetchone()["c"]
     return books, int(total)
+
+
+# --- API query helper for live-search ---
+def _query_books_api(conn: sqlite3.Connection, q: str | None, sort: str | None) -> list[dict]:
+    """Query books for the live-search API.
+
+    Returns a list of dicts including title/author fields when available.
+    """
+
+    q = _normalise_search_query(q).lower()
+    sort = (sort or "title").strip().lower()
+
+    # Sorting options. Default to title-ish.
+    if sort in {"mtime", "modified", "recent"}:
+        order_by = "modified_mtime DESC, file_name COLLATE NOCASE ASC"
+    elif sort in {"author"}:
+        order_by = "coalesce(author, '') COLLATE NOCASE ASC, coalesce(title, file_name) COLLATE NOCASE ASC"
+    elif sort in {"file", "filename", "name"}:
+        order_by = "file_name COLLATE NOCASE ASC"
+    else:
+        # title
+        order_by = "coalesce(title, file_name) COLLATE NOCASE ASC"
+
+    if q:
+        like = f"%{q}%"
+        rows = conn.execute(
+            f"""
+            SELECT rel_path, file_name, file_type, file_size, modified_mtime, title, author
+            FROM books
+            WHERE
+              lower(coalesce(title, '')) LIKE ?
+              OR lower(coalesce(author, '')) LIKE ?
+              OR lower(file_name) LIKE ?
+            ORDER BY {order_by}
+            """,
+            (like, like, like),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"""
+            SELECT rel_path, file_name, file_type, file_size, modified_mtime, title, author
+            FROM books
+            ORDER BY {order_by}
+            """
+        ).fetchall()
+
+    out: list[dict] = []
+    for r in rows:
+        rel_path = str(r["rel_path"])
+        file_name = str(r["file_name"])
+        file_type = str(r["file_type"] or "")
+        suffix = f".{file_type}" if file_type else Path(file_name).suffix or Path(rel_path).suffix
+
+        # Prefer DB title if present, otherwise derive from filename.
+        title = (r["title"] or "").strip() if "title" in r.keys() else ""
+        author = (r["author"] or "").strip() if "author" in r.keys() else ""
+
+        if not title:
+            # Many files are "Author - Title.ext".
+            stem = Path(file_name).stem
+            parts = [p.strip() for p in stem.split(" - ", 1)]
+            if len(parts) == 2:
+                if not author:
+                    author = parts[0]
+                title = parts[1]
+            else:
+                title = stem
+
+        out.append(
+            {
+                "filename": rel_path,  # kept as 'filename' for the frontend script
+                "rel_path": rel_path,
+                "file_name": file_name,
+                "file_type": file_type,
+                "suffix": suffix,
+                "size": int(r["file_size"]),
+                "mtime": int(r["modified_mtime"]),
+                "title": title,
+                "author": author,
+            }
+        )
+
+    return out
 
 
 def _safe_resolve(root: Path, rel_path: str) -> Path:
@@ -554,6 +656,25 @@ def create_app() -> FastAPI:
     templates_dir = Path(__file__).parent / "templates"
     templates = Jinja2Templates(directory=str(templates_dir))
 
+    @app.get("/api/cookbooks", response_class=JSONResponse)
+    def api_cookbooks(q: str | None = None, sort: str | None = "title") -> dict:
+        """Live-search endpoint used by the frontend.
+
+        Returns a JSON payload shaped for the JS search script in library.html.
+        """
+
+        _ensure_indexed(app)
+
+        conn: sqlite3.Connection = app.state.db
+        # Only filter once the query is long enough. Otherwise return the full shelf.
+        books = _query_books_api(conn, q=q, sort=sort)
+        _attach_cover_urls(app, books)
+
+        return {
+            "count": len(books),
+            "books": books,
+        }
+
     @app.on_event("startup")
     def _startup() -> None:
         conn = _connect_db()
@@ -591,9 +712,10 @@ def create_app() -> FastAPI:
         return {
             "status": "ok",
             "app": APP_NAME,
-            "env": _get_env("BAYLEAF_ENV", "dev"),
+            "env": get_env("BAYLEAF_ENV", "dev"),
             "db_path": _db_path(),
             "books_indexed": count,
+            "min_search_chars": _min_search_chars(),
         }
 
     @app.post("/admin/reindex", response_class=JSONResponse)
@@ -649,6 +771,7 @@ def create_app() -> FastAPI:
             )
 
         conn: sqlite3.Connection = app.state.db
+        # Apply server-side filtering only once the query is long enough.
         books, total = _query_books(conn, q)
         _attach_cover_urls(app, books)
 
@@ -804,8 +927,8 @@ if __name__ == "__main__":
 
     uvicorn.run(
         "app.main:app",
-        host=_get_env("BAYLEAF_HOST", "0.0.0.0"),
-        port=int(_get_env("BAYLEAF_PORT", "8000")),
-        reload=_get_env("BAYLEAF_RELOAD", "true").lower() in {"1", "true", "yes"},
-        log_level=_get_env("BAYLEAF_LOG_LEVEL", "info"),
+        host=get_env("BAYLEAF_HOST", "0.0.0.0"),
+        port=int(get_env("BAYLEAF_PORT", "8000")),
+        reload=get_env("BAYLEAF_RELOAD", "true").lower() in {"1", "true", "yes"},
+        log_level=get_env("BAYLEAF_LOG_LEVEL", "info"),
     )

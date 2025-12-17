@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Bayleaf</title>
-    <link rel="stylesheet" href="/static/app.css" />
+    <link rel="stylesheet" href="{{ request.url_for('static', path='app.css') }}" />
   </head>
   <body>
     <div class="container">
@@ -12,32 +12,27 @@
         <div class="brandline">
           <h1>Bayleaf</h1>
           <div class="meta">
-            {% if cookbooks %}{{ cookbooks|length }} books{% else %}No books yet{% endif %}
+            {% if total %}{{ total }} book{% if total != 1 %}s{% endif %}{% else %}No books yet{% endif %}
           </div>
         </div>
 
-        <form class="searchrow" method="get" action="/">
+        <form class="searchrow" method="get" action="{{ request.url_for('home') }}">
           <div class="searchpill">
             <input
               type="text"
               name="q"
               value="{{ q or '' }}"
-              placeholder="Search books or recipes"
+              placeholder="Search titles"
               autocomplete="off"
             />
           </div>
-
-          <div class="selectpill" title="Sort">
-            <select name="sort">
-              <option value="title" {% if sort == 'title' %}selected{% endif %}>Title</option>
-              <option value="recent" {% if sort == 'recent' %}selected{% endif %}>Recently added</option>
-              <option value="type" {% if sort == 'type' %}selected{% endif %}>File type</option>
-            </select>
-          </div>
-
           <button class="pillbtn" type="submit">Search</button>
         </form>
       </div>
+
+      {% if notice %}
+        <div class="notice">{{ notice }}</div>
+      {% endif %}
 
       {% if not cookbooks %}
         <div class="empty">
@@ -48,9 +43,10 @@
           {% for book in cookbooks %}
             <div class="card">
               <div class="cover">
+                {% set cover_src = book.cover_url or request.url_for('cover', rel_path=book.rel_path) %}
                 <img
-                  src="/cover/{{ book.rel_path | urlencode }}"
-                  alt="Cover for {{ book.display_name }}"
+                  src="{{ cover_src }}"
+                  alt="Cover for {{ book.name }}"
                   loading="lazy"
                   class="cover-img"
                   onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';"
@@ -58,16 +54,110 @@
                 <div class="placeholder" style="display:none;">No cover yet</div>
               </div>
 
-              <div class="title" title="{{ book.display_name }}">{{ book.display_name }}</div>
-              <div class="subtitle">{{ book.ext|upper }}</div>
+              <div class="title" title="{{ book.name }}">{{ book.name }}</div>
+              <div class="subtitle">{{ book.suffix|default('')|upper }}</div>
 
               <div class="actions">
-                <a class="openlink" href="/open/{{ book.rel_path }}">Open</a>
+                <a
+                  class="openlink"
+                  href="{{ request.url_for('read_book', rel_path=book.rel_path) }}"
+                >
+                  Open
+                </a>
               </div>
             </div>
           {% endfor %}
         </div>
       {% endif %}
     </div>
+    <script>
+      const input = document.querySelector('input[name="q"]');
+      const sortSelect = document.querySelector('select[name="sort"]');
+      const grid = document.querySelector('.grid');
+
+      // If the page rendered with no grid (e.g. empty state), skip live search wiring.
+      if (input && grid) {
+        function esc(s) {
+          return (s || "").replace(/[&<>"']/g, (c) => ({
+            "&": "&amp;",
+            "<": "&lt;",
+            ">": "&gt;",
+            '"': "&quot;",
+            "'": "&#39;",
+          }[c]));
+        }
+
+        function pick(obj, keys, fallback = "") {
+          for (const k of keys) {
+            if (obj && obj[k] != null && String(obj[k]).trim() !== "") return obj[k];
+          }
+          return fallback;
+        }
+
+        function cardHTML(b) {
+          const relPath = pick(b, ["rel_path", "filename", "path"], "");
+          const name = pick(b, ["name", "title"], relPath);
+          const suffix = pick(b, ["suffix"], "");
+          const coverSrc = pick(b, ["cover_url"], relPath ? `/cover/${encodeURIComponent(relPath)}` : "");
+          const readHref = relPath ? `/read/${encodeURIComponent(relPath)}` : "#";
+
+          return `
+            <div class="card">
+              <div class="cover">
+                <img
+                  src="${coverSrc}"
+                  alt="Cover for ${esc(name)}"
+                  loading="lazy"
+                  class="cover-img"
+                  onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';"
+                />
+                <div class="placeholder" style="display:none;">No cover yet</div>
+              </div>
+
+              <div class="title" title="${esc(name)}">${esc(name)}</div>
+              <div class="subtitle">${esc(String(suffix).toUpperCase())}</div>
+
+              <div class="actions">
+                <a class="openlink" href="${readHref}">Open</a>
+              </div>
+            </div>
+          `;
+        }
+
+        let t = null;
+
+        async function runSearch() {
+          const q = (input.value || "").trim();
+          const sort = sortSelect ? (sortSelect.value || "title") : "title";
+
+          // Only start filtering once the user has typed 3+ characters.
+          // But if they clear the box, refresh back to the full shelf.
+          if (q.length > 0 && q.length < 3) {
+            return;
+          }
+
+          const res = await fetch(`/api/cookbooks?q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}`);
+          if (!res.ok) return;
+
+          const payload = await res.json();
+          const books = Array.isArray(payload) ? payload : (payload.items || payload.books || []);
+
+          if (!books.length) {
+            grid.innerHTML = `<div class="empty">No matches.</div>`;
+            return;
+          }
+
+          grid.innerHTML = books.map(cardHTML).join("");
+        }
+
+        function scheduleSearch() {
+          clearTimeout(t);
+          t = setTimeout(runSearch, 180);
+        }
+
+        input.addEventListener("input", scheduleSearch);
+        if (sortSelect) sortSelect.addEventListener("change", runSearch);
+      }
+    </script>
   </body>
 </html>
