@@ -93,10 +93,8 @@
                   <div class="placeholder" style="display:none;">No cover yet</div>
                 </div>
 
-                <div class="title" title="{{ book.name }}">{{ book.name }}</div>
-                <div class="book-meta">
-                  {% if book.author %}<div class="book-author">{{ book.author }}</div>{% endif %}
-                  {% if book.published_year %}<div class="book-year">{{ book.published_year }}</div>{% endif %}
+                <div class="card-cta">
+                  <button class="btn read-btn" type="button">Read book</button>
                 </div>
               </div>
             </a>
@@ -159,10 +157,8 @@
                   <div class="placeholder" style="display:none;">No cover yet</div>
                 </div>
 
-                <div class="title" title="${esc(name)}">${esc(name)}</div>
-                <div class="book-meta">
-                  ${author ? `<div class="book-author">${esc(author)}</div>` : ""}
-                  ${year ? `<div class="book-year">${esc(year)}</div>` : ""}
+                <div class="card-cta">
+                  <button class="btn read-btn" type="button">Read book</button>
                 </div>
               </div>
             </a>
