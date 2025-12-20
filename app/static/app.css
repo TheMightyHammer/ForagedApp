@@ -470,12 +470,24 @@ body.reader-page .notice {
   padding: 12px 12px 14px;
 }
 
+.card-cta--stack {
+  flex-direction: column;
+  gap: 8px;
+}
+
 .read-btn {
   width: 100%;
   max-width: 180px;
   font-weight: 700;
   font-size: 15px;
   color: var(--bay-green);
+}
+
+.reextract-btn {
+  width: 100%;
+  max-width: 180px;
+  font-size: 12px;
+  letter-spacing: 0.01em;
 }
 
 .author {

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from html.parser import HTMLParser
 from pathlib import Path
 import re
@@ -12,6 +13,13 @@ from typing import Iterable, List, Optional
 
 from ebooklib import epub
 
+from app.config import get_env
+from app.epub_recipe_engine import (
+    extract_recipe_image_href,
+    extract_recipe_plaintext,
+    extract_recipes_from_epub_index,
+    split_recipe_text,
+)
 
 IGNORE_TITLE_RE = re.compile(
     r"(acknowledg|equipment|conversion|glossary|index|about the author|contents|"
@@ -103,7 +111,24 @@ def _parse_blocks(html: bytes) -> List[TextBlock]:
 
 
 def _title_ignored(title: str) -> bool:
-    return bool(IGNORE_TITLE_RE.search(title))
+    if IGNORE_TITLE_RE.search(title):
+        return True
+    custom = _custom_ignore_re()
+    if custom and custom.search(title):
+        return True
+    return False
+
+
+@lru_cache(maxsize=1)
+def _custom_ignore_re() -> re.Pattern[str] | None:
+    raw = get_env("BAYLEAF_RECIPE_IGNORE_TITLES", "").strip()
+    if not raw:
+        return None
+    tokens = [t.strip() for t in raw.split(",") if t.strip()]
+    if not tokens:
+        return None
+    escaped = [re.escape(token) for token in tokens]
+    return re.compile("|".join(escaped), re.IGNORECASE)
 
 
 def _extract_section(blocks: List[TextBlock]) -> List[dict]:
@@ -111,7 +136,7 @@ def _extract_section(blocks: List[TextBlock]) -> List[dict]:
     current: dict | None = None
 
     for block in blocks:
-        if block.is_heading and block.level is not None and block.level <= 3:
+        if block.is_heading and block.level is not None and block.level <= 4:
             if current:
                 sections.append(current)
             current = {
@@ -148,8 +173,8 @@ def _collect_recipe_from_section(section: dict, href: str) -> Optional[dict]:
             if src.startswith("/"):
                 image_href = src.lstrip("/")
             else:
-                base_dir = PurePosixPath(href).parent
-                image_href = str((base_dir / src).as_posix())
+                base_dir = posixpath.dirname(href)
+                image_href = posixpath.normpath(posixpath.join(base_dir, src)).lstrip("/")
             continue
         if block.is_heading:
             if INGREDIENTS_RE.search(block.text):
@@ -189,6 +214,10 @@ def extract_epub_recipes(epub_path: Path, *, max_recipes: int | None = None) -> 
     if _is_crumbs_doilies(epub_path):
         return extract_crumbs_doilies_recipes(epub_path, max_recipes=max_recipes)
 
+    index_recipes = _extract_epub_recipes_from_index(epub_path, max_recipes=max_recipes)
+    if index_recipes:
+        return index_recipes
+
     book = epub.read_epub(str(epub_path))
     recipes: List[dict] = []
 
@@ -208,6 +237,65 @@ def extract_epub_recipes(epub_path: Path, *, max_recipes: int | None = None) -> 
 def _is_crumbs_doilies(epub_path: Path) -> bool:
     name = epub_path.name.lower()
     return "crumbs" in name and "doilies" in name
+
+
+def _extract_epub_recipes_from_index(
+    epub_path: Path, *, max_recipes: int | None = None
+) -> List[dict]:
+    try:
+        candidates = extract_recipes_from_epub_index(epub_path)
+    except Exception:
+        return []
+
+    recipes: List[dict] = []
+    seen_keys: set[str] = set()
+    limit = None if max_recipes is None or max_recipes <= 0 else max_recipes
+
+    for candidate in candidates:
+        title = (candidate.title or "").strip()
+        href = (candidate.href or "").strip()
+        if not title or not href:
+            continue
+        if _title_ignored(title):
+            continue
+        if href in seen_keys:
+            continue
+
+        text = extract_recipe_plaintext(epub_path, href)
+        image_href = extract_recipe_image_href(epub_path, href)
+        ingredients, method = split_recipe_text(text)
+        method_text = (method or "").strip()
+        if not method_text:
+            continue
+
+        recipes.append(
+            {
+                "title": title,
+                "ingredients_text": "\n".join(ingredients).strip() or None,
+                "method_text": method_text,
+                "source_type": "epub:index",
+                "source_key": href,
+                "location_type": "href",
+                "location_value": href,
+                "image_href": image_href,
+            }
+        )
+        seen_keys.add(href)
+
+        if limit is not None and len(recipes) >= limit:
+            break
+
+    return recipes
+
+
+def _has_class(classes: Iterable[str], *targets: str) -> bool:
+    if not classes:
+        return False
+    normalized = {c.lower().replace("-", "_") for c in classes if c}
+    for target in targets:
+        if target.lower().replace("-", "_") in normalized:
+            return True
+    return False
 
 
 class CrumbsParser(HTMLParser):
@@ -294,39 +382,44 @@ class CrumbsParser(HTMLParser):
         attr_map = {k: v for k, v in attrs}
         classes = (attr_map.get("class") or "").split()
 
-        if tag == "h2" and "rec_head" in classes:
+        if tag == "h2" and _has_class(classes, "rec_head", "recipe_head", "rec_title", "rec-title"):
             self._capture = "recipe_title"
             self._buf = []
             self._pending_recipe_id = attr_map.get("id")
             return
 
-        if tag == "h5" and "ingredient_header" in classes:
+        if tag == "h5" and _has_class(classes, "ingredient_header", "ingredient-head", "ingredient_title"):
             self._capture = "ingredient_header"
             self._buf = []
             return
 
-        if tag == "li" and "ingred" in classes:
+        if tag == "li" and _has_class(classes, "ingred", "ingredient", "ingredient_item"):
             self._capture = "ingredient_item"
             self._buf = []
             return
 
-        if tag == "h4" and "rec_subhead" in classes:
+        if tag == "h4" and _has_class(classes, "rec_subhead", "rec-subhead", "method_head"):
             self._in_tip = False
             self._capture = "method_heading"
             self._buf = []
             return
 
-        if tag == "h4" and "tip_head" in classes:
+        if tag == "h4" and _has_class(classes, "tip_head", "tip-head", "tip_subhead"):
             self._capture = "method_heading"
             self._buf = []
             self._in_tip = True
             return
 
         if tag == "p" and (
-            "method" in classes
-            or "method2" in classes
-            or "rec_intro" in classes
-            or "no_indent" in classes
+            _has_class(
+                classes,
+                "method",
+                "method2",
+                "rec_intro",
+                "rec-intro",
+                "no_indent",
+                "method_text",
+            )
         ):
             self._capture = "method"
             self._buf = []
@@ -363,8 +456,6 @@ def extract_crumbs_doilies_recipes(
     recipes: List[dict] = []
 
     for href, html in _iter_spine_docs(book):
-        if "chapter" not in href or "_01" not in href:
-            continue
         parser = CrumbsParser(href)
         parser.feed(html.decode("utf-8", errors="ignore"))
         parser._finish_recipe()

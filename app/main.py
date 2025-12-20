@@ -718,7 +718,15 @@ def _index_recipes(
         candidates.append(b)
 
     extracted = 0
+    processed = 0
+    skipped = 0
     limit = None if recipe_book_limit <= 0 else recipe_book_limit
+    if candidates:
+        logger.info(
+            "Recipe extraction starting: epubs=%s limit=%s",
+            len(candidates),
+            limit if limit is not None else "all",
+        )
     for b in candidates[:limit]:
         rel_path = str(b.get("rel_path") or "")
         if not rel_path:
@@ -736,12 +744,15 @@ def _index_recipes(
         is_crumbs = "crumbs" in epub_path.name.lower() and "doilies" in epub_path.name.lower()
         if is_crumbs:
             if _count_recipes_for_book_source(conn, book_id, "epub:crumbs_doilies") > 0:
+                skipped += 1
                 continue
             conn.execute("DELETE FROM recipes WHERE book_id = ?", (book_id,))
         else:
             if _count_recipes_for_book(conn, book_id) > 0:
+                skipped += 1
                 continue
 
+        processed += 1
         try:
             recipes = extract_epub_recipes(epub_path, max_recipes=200)
         except Exception as exc:
@@ -757,7 +768,46 @@ def _index_recipes(
 
         extracted += len(recipes)
 
+    if candidates:
+        logger.info(
+            "Recipe extraction complete: processed=%s skipped=%s recipes=%s",
+            processed,
+            skipped,
+            extracted,
+        )
+
     return extracted
+
+
+def _reextract_recipes_for_book(
+    conn: sqlite3.Connection,
+    library_dir: Path,
+    rel_path: str,
+    *,
+    max_recipes: int = 200,
+) -> dict:
+    rel_path = (rel_path or "").strip()
+    if not rel_path:
+        return {"error": "Missing book path", "extracted": 0}
+
+    book_id = _book_id_for_rel_path(conn, rel_path)
+    if book_id is None:
+        return {"error": "Book not indexed", "extracted": 0}
+
+    file_path = _safe_resolve(library_dir, rel_path)
+    if file_path.suffix.lower() != ".epub":
+        return {"error": "Only EPUB recipes can be re-extracted", "extracted": 0}
+
+    logger.info("Recipe re-extract starting: %s", rel_path)
+    recipes = extract_epub_recipes(file_path, max_recipes=max_recipes)
+
+    with conn:
+        conn.execute("DELETE FROM recipes WHERE book_id = ?", (book_id,))
+        for recipe in recipes:
+            _upsert_recipe(conn, book_id, recipe)
+
+    logger.info("Recipe re-extract complete: %s recipes=%s", rel_path, len(recipes))
+    return {"rel_path": rel_path, "extracted": len(recipes)}
 
 
 def _index_books(conn: sqlite3.Connection, library_dir: Path | str) -> tuple[int, int]:
@@ -1281,24 +1331,34 @@ def create_app() -> FastAPI:
         settings = get_settings()
         logger.info("Startup. library_dir=%s db_path=%s", settings.library_dir, _db_path())
 
-        try:
-            startup_conn = _connect_db()
+        def _run_startup_index() -> None:
+            app.state.indexing_in_progress = True
             try:
-                _init_db(startup_conn)
-                indexed_books, indexed_recipes = _index_books(startup_conn, settings.library_dir)
-            finally:
+                startup_conn = _connect_db()
                 try:
-                    startup_conn.close()
-                except Exception:
-                    pass
-            logger.info(
-                "Startup indexing complete. indexed_books=%s indexed_recipes=%s",
-                indexed_books,
-                indexed_recipes,
-            )
-        except Exception as exc:
-            logger.exception("Startup indexing failed: %s", exc)
-            app.state.last_index_error = str(exc)
+                    _init_db(startup_conn)
+                    indexed_books, indexed_recipes = _index_books(
+                        startup_conn, settings.library_dir
+                    )
+                finally:
+                    try:
+                        startup_conn.close()
+                    except Exception:
+                        pass
+                logger.info(
+                    "Startup indexing complete. indexed_books=%s indexed_recipes=%s",
+                    indexed_books,
+                    indexed_recipes,
+                )
+            except Exception as exc:
+                logger.exception("Startup indexing failed: %s", exc)
+                app.state.last_index_error = str(exc)
+            finally:
+                app.state.indexing_in_progress = False
+
+        import threading
+
+        threading.Thread(target=_run_startup_index, daemon=True).start()
 
     @app.get("/health", response_class=JSONResponse)
     def health() -> dict:
@@ -1317,60 +1377,142 @@ def create_app() -> FastAPI:
             "db_path": _db_path(),
             "books_indexed": count,
             "min_search_chars": _min_search_chars(),
+            "indexing_in_progress": bool(getattr(app.state, "indexing_in_progress", False)),
+            "reindex_in_progress": bool(getattr(app.state, "reindex_in_progress", False)),
         }
 
     @app.post("/admin/reindex", response_class=JSONResponse)
-    def admin_reindex() -> dict:
+    def admin_reindex(
+        full: bool = Query(False),
+        async_: bool = Query(False, alias="async"),
+    ) -> dict:
         """Re-run indexing.
 
         MVP note: This must be protected (auth or reverse proxy rules) before exposing publicly.
         """
+        if getattr(app.state, "reindex_in_progress", False):
+            return {"error": "Reindex already in progress"}
 
+        def _run_reindex() -> dict:
+            settings = get_settings()
+
+            library_dir = settings.library_dir
+            if not library_dir.exists():
+                return {
+                    "indexed_books": 0,
+                    "indexed_recipes": 0,
+                    "library_dir": str(library_dir),
+                    "error": "Library directory not found",
+                    "epub_count": 0,
+                }
+
+            # Use a fresh connection for reindexing so we never collide with the shared
+            # connection's transaction state (health checks, concurrent requests, etc.).
+            conn = _connect_db()
+            try:
+                _init_db(conn)
+                if full:
+                    with conn:
+                        conn.execute("DELETE FROM recipes")
+                indexed_books, indexed_recipes = _index_books(conn, settings.library_dir)
+
+                # Refresh the long-lived connection so subsequent requests (health/home)
+                # see the newly committed data immediately.
+                old: sqlite3.Connection | None = getattr(app.state, "db", None)
+                try:
+                    if old is not None:
+                        old.close()
+                except Exception:
+                    pass
+
+                fresh = _connect_db()
+                _init_db(fresh)
+                app.state.db = fresh
+
+                epub_count = sum(
+                    1
+                    for b in list_cookbooks(library_dir)
+                    if str(getattr(b, "suffix", "")).lower() == ".epub"
+                )
+                return {
+                    "indexed_books": indexed_books,
+                    "indexed_recipes": indexed_recipes,
+                    "library_dir": str(settings.library_dir),
+                    "epub_count": epub_count,
+                }
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        if async_:
+            import threading
+
+            def _worker() -> None:
+                app.state.reindex_in_progress = True
+                try:
+                    app.state.last_reindex_result = _run_reindex()
+                except Exception as exc:
+                    logger.exception("Admin reindex failed: %s", exc)
+                    app.state.last_index_error = str(exc)
+                    app.state.last_reindex_result = {"error": str(exc)}
+                finally:
+                    app.state.reindex_in_progress = False
+
+            threading.Thread(target=_worker, daemon=True).start()
+            return {"status": "started", "full": full}
+
+        try:
+            return _run_reindex()
+        except Exception as exc:
+            logger.exception("Admin reindex failed: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @app.get("/admin/recipe-report", response_class=JSONResponse)
+    def admin_recipe_report(
+        path: str = Query(..., alias="path"),
+        limit: int = Query(12, ge=1, le=200),
+    ) -> dict:
+        """Return a sample of extracted recipes for a single book."""
         settings = get_settings()
+        file_path = _safe_resolve(settings.library_dir, path)
+        if file_path.suffix.lower() != ".epub":
+            raise HTTPException(status_code=400, detail="Only EPUB files are supported")
 
-        library_dir = settings.library_dir
-        if not library_dir.exists():
-            return {
-                "indexed_books": 0,
-                "indexed_recipes": 0,
-                "library_dir": str(library_dir),
-                "error": "Library directory not found",
-                "epub_count": 0,
+        recipes = extract_epub_recipes(file_path, max_recipes=limit)
+        sample = [
+            {
+                "title": r.get("title"),
+                "source_key": r.get("source_key"),
+                "image_href": r.get("image_href"),
+                "has_ingredients": bool(r.get("ingredients_text")),
+                "has_method": bool(r.get("method_text")),
             }
+            for r in recipes
+        ]
+        return {
+            "rel_path": path,
+            "limit": limit,
+            "extracted": len(recipes),
+            "sample": sample,
+        }
 
-        # Use a fresh connection for reindexing so we never collide with the shared
-        # connection's transaction state (health checks, concurrent requests, etc.).
+    @app.post("/admin/reextract-recipes", response_class=JSONResponse)
+    def admin_reextract_recipes(path: str = Query(..., alias="path")) -> dict:
+        """Force re-extraction of recipes for a single book."""
+        settings = get_settings()
         conn = _connect_db()
         try:
             _init_db(conn)
-            indexed_books, indexed_recipes = _index_books(conn, settings.library_dir)
-
-            # Refresh the long-lived connection so subsequent requests (health/home)
-            # see the newly committed data immediately.
-            old: sqlite3.Connection | None = getattr(app.state, "db", None)
-            try:
-                if old is not None:
-                    old.close()
-            except Exception:
-                pass
-
-            fresh = _connect_db()
-            _init_db(fresh)
-            app.state.db = fresh
-
-            epub_count = sum(
-                1
-                for b in list_cookbooks(library_dir)
-                if str(getattr(b, "suffix", "")).lower() == ".epub"
-            )
-            return {
-                "indexed_books": indexed_books,
-                "indexed_recipes": indexed_recipes,
-                "library_dir": str(settings.library_dir),
-                "epub_count": epub_count,
-            }
+            result = _reextract_recipes_for_book(conn, settings.library_dir, path)
+            if result.get("error"):
+                return result
+            return result
+        except HTTPException:
+            raise
         except Exception as exc:
-            logger.exception("Admin reindex failed: %s", exc)
+            logger.exception("Recipe re-extract failed: %s", exc)
             raise HTTPException(status_code=500, detail=str(exc))
         finally:
             try:

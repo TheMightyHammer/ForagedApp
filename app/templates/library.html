@@ -80,6 +80,7 @@
                 data-author="{{ (book.author or '')|e }}"
                 data-year="{{ (book.published_year or '')|e }}"
                 data-rel-path="{{ (book.rel_path or '')|e }}"
+                data-suffix="{{ (book.suffix or '')|e }}"
                 data-cover-url="{{ (book.cover_url or '')|e }}"
               >
                 <div class="cover">
@@ -94,8 +95,13 @@
                   <div class="placeholder" style="display:none;">No cover yet</div>
                 </div>
 
-                <div class="card-cta">
+                <div class="card-cta card-cta--stack">
                   <button class="btn read-btn" type="button">Read book</button>
+                  {% if (book.suffix or '')|lower == '.epub' %}
+                    <button class="btn reextract-btn" type="button" data-default-label="Re-extract recipes">
+                      Re-extract recipes
+                    </button>
+                  {% endif %}
                 </div>
               </div>
             </a>
@@ -132,6 +138,7 @@
           author: el.dataset.author || "",
           year: el.dataset.year || "",
           rel_path: el.dataset.relPath || "",
+          suffix: el.dataset.suffix || "",
           cover_url: el.dataset.coverUrl || "",
         }));
 
@@ -140,13 +147,15 @@
           const author = b.author || "";
           const year = b.year || "";
           const relPath = b.rel_path || "";
+          const suffix = (b.suffix || "").toLowerCase();
+          const showReextract = suffix === ".epub";
           // Use encodeURI so path separators remain intact if relPath contains subfolders.
           const coverSrc = b.cover_url || (relPath ? `/cover/${encodeURI(relPath)}` : "");
           const readerHref = relPath ? `/read?path=${encodeURIComponent(relPath)}` : "#";
 
           return `
             <a class="card-link" href="${readerHref}" target="_blank" rel="noopener" title="Open reader">
-              <div class="card">
+              <div class="card" data-rel-path="${esc(relPath)}" data-suffix="${esc(suffix)}" data-name="${esc(name)}">
                 <div class="cover">
                   <img
                     src="${coverSrc}"
@@ -158,8 +167,13 @@
                   <div class="placeholder" style="display:none;">No cover yet</div>
                 </div>
 
-                <div class="card-cta">
+                <div class="card-cta card-cta--stack">
                   <button class="btn read-btn" type="button">Read book</button>
+                  ${
+                    showReextract
+                      ? `<button class="btn reextract-btn" type="button" data-default-label="Re-extract recipes">Re-extract recipes</button>`
+                      : ""
+                  }
                 </div>
               </div>
             </a>
@@ -206,6 +220,60 @@
             return;
           }
           grid.innerHTML = books.map(cardHTML).join('');
+          bindReextractButtons();
+        }
+
+        async function runReextract(relPath, title, btn) {
+          if (!relPath) return;
+          const statusEl = document.getElementById("reindexStatus");
+          const defaultLabel = btn?.dataset?.defaultLabel || btn?.textContent || "Re-extract recipes";
+          if (btn) {
+            btn.disabled = true;
+            btn.textContent = "Re-extracting…";
+          }
+          if (statusEl) {
+            statusEl.textContent = `Re-extracting recipes for ${title || relPath}…`;
+          }
+          try {
+            const res = await fetch(`/admin/reextract-recipes?path=${encodeURIComponent(relPath)}`, {
+              method: "POST",
+            });
+            if (!res.ok) {
+              const txt = await res.text();
+              throw new Error(txt || `HTTP ${res.status}`);
+            }
+            const data = await res.json();
+            if (data.error) {
+              if (statusEl) statusEl.textContent = data.error;
+            } else if (statusEl) {
+              const count = data.extracted ?? 0;
+              statusEl.textContent = `Re-extracted ${count} recipe${count === 1 ? "" : "s"} for ${title || relPath}.`;
+            }
+          } catch (err) {
+            if (statusEl) statusEl.textContent = "Re-extract failed. Check logs.";
+            console.error(err);
+          } finally {
+            if (btn) {
+              btn.disabled = false;
+              btn.textContent = defaultLabel;
+            }
+          }
+        }
+
+        function bindReextractButtons() {
+          const buttons = Array.from(grid.querySelectorAll('.reextract-btn'));
+          buttons.forEach((btn) => {
+            if (btn.dataset.bound === "1") return;
+            btn.dataset.bound = "1";
+            btn.addEventListener('click', (event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              const card = btn.closest('.card');
+              const relPath = card?.dataset?.relPath || "";
+              const title = card?.dataset?.name || relPath || "book";
+              runReextract(relPath, title, btn);
+            });
+          });
         }
 
         function apply() {
